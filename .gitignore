@@ -1,3 +1,7 @@
+cli/*
+lib/*
+*.txt
+!CMakeLists.txt
 # Prerequisites
 *.d
 

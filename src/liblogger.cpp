@@ -1,7 +1,10 @@
+#include <ostream>
+#include <sys/types.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
 #include "liblogger.hpp"
+#include <cstdlib>
 #include <iostream>
 #include <ios>
 #include <string>
@@ -15,6 +18,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <mutex>
 
 using namespace std::chrono_literals;
 using std::string;
@@ -26,13 +30,20 @@ Logger::Logger(string Path, int DefLoglevel) {
     #endif
 
     isLevelValid(DefLoglevel);
+    isWorkerRunning = true;
     this->Path = Path;
     this->DefLoglevel = DefLoglevel;
+    worker = std::thread(&Logger::socketWorkerLoop, this);
+}
+
+Logger::~Logger() {
+    isWorkerRunning = 0;
+    worker.join();
 }
 
 void Logger::Log(string message, int LogLevel) {
     if (message.empty()) {
-        std::cout << "[WARN] liblogger: empty log message" << "\n";
+        std::cout << "[WARN] liblogger: empty log message" << std::endl;
         return;
     }
     isLevelValid(LogLevel);
@@ -44,12 +55,26 @@ void Logger::Log(string message, int LogLevel) {
     if (!file.is_open()) {
         throw std::runtime_error("[ERROR] liblogger: unable to open the file");
     }
-    auto timePoint = std::chrono::system_clock::now();
-    time_t time = std::chrono::system_clock::to_time_t(timePoint);
-    string formattedTime = (std::ctime(&time));
-    formattedTime.pop_back();
+    std::string timeNow = getTimeNow();
 
-    file << "[" << formattedTime << "] " << "[level: " << LogLevel << "] " << message << std::endl;
+    file << "[" << timeNow << "] " << "[level: " << LogLevel << "] " << message << std::endl;
+}
+
+void Logger::SocketLog(std::string message, int LogLevel) {
+    if (message.empty()) {
+        std::cout << "[WARN] liblogger: empty log message" << std::endl;
+        return;
+    }
+    isLevelValid(LogLevel);
+    if (LogLevel < DefLoglevel) {
+        return;
+    }
+    std::string timeNow = getTimeNow();
+    std::string msg = "[" + timeNow + "] " + "[level: " + std::to_string(LogLevel) + "] " + message + '\n';
+    {
+        std::lock_guard lock(chanMutex);
+        chan.push(msg);
+    }
 }
 
 void Logger::isLevelValid(int Level) {
@@ -61,36 +86,70 @@ void Logger::isLevelValid(int Level) {
 void Logger::socketWorkerLoop() {
     int sockWorker = -1;
 
-    while (true) {
-        makeSock(&sockWorker);
-
+    while (isWorkerRunning) {
+        int res = 0;
+        if (sockWorker == -1) {
+            res = makeSock(&sockWorker);
+        } 
+        if (res == -1 ) continue;
+        res = sendData(&sockWorker);
+        if (res == -1) continue;
     }
 }
 
+
+
 int Logger::makeSock(int* sock) {
-    if (*sock != -1) {
-        return -1;
-    }
     *sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (*sock == -1) return -1;
 
     struct sockaddr_in s;
     s.sin_family = AF_INET;
     s.sin_port = htons(Port);
 
     int err = inet_pton(AF_INET, IPAddress, &s.sin_addr);
-    if (err == -1) {
+    if (err == -1 || err == 0) {
         std::cerr << "[ERROR] liblogger: incorrect ip address" << '\n';
+        exit(-1);
     }
 
     err = connect(*sock, (struct sockaddr *) &s, sizeof(s));
-    if (err != -1) {
-        std::cout << "[ERROR] liblogger: connection error, retrying in 5s" << '\n';
+    if (err == -1) {
+        std::cout << "[ERROR] liblogger: connection error, retrying in 5s" << std::endl;
         std::this_thread::sleep_for(5s);
         close(*sock);
         *sock = -1;
-    }  
+        return -1;
+    }
+    return 0;
 }
 
-void Logger::sendData(int* sock) {
+int Logger::sendData(int* sock) {
+    std::string msg;
+    {
+        std::lock_guard lock(chanMutex);
+        msg = chan.front();
+        chan.pop();
+    }
+    ssize_t sentCounter = 0;
+    for (int byteCtr = msg.size(); byteCtr > sentCounter;) {
+        ssize_t res = send(*sock, msg.data() + sentCounter, msg.size() - sentCounter, MSG_NOSIGNAL );
+        if (res == -1) {
+            *sock = -1;
+            std::lock_guard lock(chanMutex);
+            chan.push(msg);
+            return res;
+        }
+        sentCounter += res;
 
+    }
+    return 0;
+}
+
+std::string Logger::getTimeNow() {
+    auto timePoint = std::chrono::system_clock::now();
+    time_t time = std::chrono::system_clock::to_time_t(timePoint);
+    string formattedTime = (std::ctime(&time));
+    formattedTime.pop_back();
+    return formattedTime;
 }
