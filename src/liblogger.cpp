@@ -1,15 +1,11 @@
-#include <ostream>
-#include <sys/types.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
 #include "liblogger.hpp"
-#include <cstdlib>
 #include <iostream>
 #include <ios>
 #include <string>
 #include <chrono>
 #include <fstream>
+#include <ostream>
+#include <sys/types.h>
 #include <ctime>
 #include <stdexcept>
 #include <queue>
@@ -24,20 +20,17 @@ using namespace std::chrono_literals;
 using std::string;
 
 Logger::Logger(string Path, int DefLoglevel) {
-    #ifdef _WIN32
-    SetConsoleCP(CP_UTF8);
-    SetConsoleOutputCP(CP_UTF8);
-    #endif
 
     isLevelValid(DefLoglevel);
-    isWorkerRunning = true;
+    isWorkerRunning.store(true);
     this->Path = Path;
     this->DefLoglevel = DefLoglevel;
     worker = std::thread(&Logger::socketWorkerLoop, this);
 }
 
 Logger::~Logger() {
-    isWorkerRunning = 0;
+    isWorkerRunning.store(false);
+    cv.notify_one();
     worker.join();
 }
 
@@ -56,8 +49,10 @@ void Logger::Log(string message, int LogLevel) {
         throw std::runtime_error("[ERROR] liblogger: unable to open the file");
     }
     std::string timeNow = getTimeNow();
-
-    file << "[" << timeNow << "] " << "[level: " << LogLevel << "] " << message << std::endl;
+    {
+        std::lock_guard fLock(fileMutex);
+        file << "[" << timeNow << "] " << "[level: " << LogLevel << "] " << message << std::endl;
+    }
 }
 
 void Logger::SocketLog(std::string message, int LogLevel) {
@@ -75,6 +70,7 @@ void Logger::SocketLog(std::string message, int LogLevel) {
         std::lock_guard lock(chanMutex);
         chan.push(msg);
     }
+    cv.notify_one();
 }
 
 void Logger::isLevelValid(int Level) {
@@ -85,15 +81,25 @@ void Logger::isLevelValid(int Level) {
 
 void Logger::socketWorkerLoop() {
     int sockWorker = -1;
-
-    while (isWorkerRunning) {
+    std::unique_lock lock(chanMutex);
+    while (isWorkerRunning.load() || !chan.empty()) {
+        cv.wait(lock, [this] { return isWorkerRunning.load() || !chan.empty(); });
+        lock.unlock();
         int res = 0;
         if (sockWorker == -1) {
             res = makeSock(&sockWorker);
         } 
-        if (res == -1 ) continue;
+        if (res == -1 ) {
+            lock.lock();
+            continue;
+        }
+        else if (res == -2) break;
         res = sendData(&sockWorker);
-        if (res == -1) continue;
+        if (res == -1) {
+            lock.lock();
+            continue;
+        }
+        lock.lock();
     }
 }
 
@@ -109,8 +115,8 @@ int Logger::makeSock(int* sock) {
 
     int err = inet_pton(AF_INET, IPAddress, &s.sin_addr);
     if (err == -1 || err == 0) {
-        std::cerr << "[ERROR] liblogger: incorrect ip address" << '\n';
-        exit(-1);
+        std::cerr << "[WARN] liblogger: incorrect ip address, stopping socket worker" << '\n';
+        return -2;
     }
 
     err = connect(*sock, (struct sockaddr *) &s, sizeof(s));
@@ -147,9 +153,12 @@ int Logger::sendData(int* sock) {
 }
 
 std::string Logger::getTimeNow() {
-    auto timePoint = std::chrono::system_clock::now();
-    time_t time = std::chrono::system_clock::to_time_t(timePoint);
-    string formattedTime = (std::ctime(&time));
-    formattedTime.pop_back();
-    return formattedTime;
+    auto now = std::chrono::system_clock::now();
+    std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&time, &tm);
+
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return std::string(buf);
 }
