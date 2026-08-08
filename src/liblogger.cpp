@@ -15,23 +15,32 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <mutex>
+#include <utility>
 
 using namespace std::chrono_literals;
 using std::string;
 
-Logger::Logger(string Path, int DefLoglevel) {
-
-    isLevelValid(DefLoglevel);
+Logger::Logger(string Path, int DefLoglevel, string IP, int Port ){
     isWorkerRunning.store(true);
-    this->Path = Path;
+    isLevelValid(DefLoglevel);
+    this->Port = Port;
+    this->Path = std::move(Path);
     this->DefLoglevel = DefLoglevel;
+    this->IPAddress = std::move(IP);
     worker = std::thread(&Logger::socketWorkerLoop, this);
+}
+Logger::Logger(string Path, int DefLoglevel) {
+    isLevelValid(DefLoglevel);
+    this->Path = std::move(Path);
+    this->DefLoglevel = DefLoglevel;
 }
 
 Logger::~Logger() {
-    isWorkerRunning.store(false);
-    cv.notify_one();
-    worker.join();
+    if (worker.joinable()) {
+        isWorkerRunning.store(false);
+        cv.notify_one();
+        worker.join();
+    }
 }
 
 void Logger::Log(string message, int LogLevel) {
@@ -113,7 +122,7 @@ int Logger::makeSock(int* sock) {
     s.sin_family = AF_INET;
     s.sin_port = htons(Port);
 
-    int err = inet_pton(AF_INET, IPAddress, &s.sin_addr);
+    int err = inet_pton(AF_INET, IPAddress.c_str(), &s.sin_addr);
     if (err == -1 || err == 0) {
         std::cerr << "[WARN] liblogger: incorrect ip address, stopping socket worker" << '\n';
         return -2;

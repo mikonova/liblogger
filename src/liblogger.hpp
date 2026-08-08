@@ -17,10 +17,11 @@ class Logger {
     public:
     int DefLoglevel;
     int Port = 44044;
-    char IPAddress[15];
+    std::string IPAddress;
     std::string Path;
     
     // initialize a new logger instance and start the worker loop
+    Logger(std::string Path, int DefLoglevel, std::string IP, int Port);
     Logger(std::string Path, int DefLoglevel);
     ~Logger();
 
